@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Fintech fraud detection demo with simulated transaction data.">
+  <title>Fraud Detection Demo</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: light; }
+    body {
+      margin: 0;
+      background: #ffffff;
+      color: #111111;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      line-height: 1.5;
+    }
+    main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+    h1 { font-size: 1.75rem; margin: 0 0 4px; }
+    h2 { font-size: 1.2rem; margin: 36px 0 8px; }
+    h3 { font-size: 1rem; margin: 20px 0 6px; }
+    p { margin: 4px 0 12px; }
+    .muted { color: #555555; }
+
+    button {
+      font: inherit;
+      padding: 8px 14px;
+      border: 1px solid #333333;
+      border-radius: 4px;
+      background: #f2f2f2;
+      color: #111111;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #e2e2e2; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    label { font-size: 0.95rem; }
+    input[type="number"] {
+      font: inherit;
+      width: 8rem;
+      padding: 6px 8px;
+      border: 1px solid #333333;
+      border-radius: 4px;
+      background: #ffffff;
+      color: #111111;
+    }
+
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: 360px;
+      border: 1px solid #cccccc;
+      margin: 8px 0;
+    }
+    table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+    th, td {
+      padding: 4px 10px;
+      text-align: right;
+      white-space: nowrap;
+      border-bottom: 1px solid #eeeeee;
+    }
+    th { position: sticky; top: 0; background: #f2f2f2; }
+
+    .counts { display: flex; flex-wrap: wrap; gap: 24px; margin: 12px 0; }
+    .counts div { font-size: 0.95rem; }
+    .counts strong { display: block; font-size: 1.6rem; line-height: 1.2; }
+
+    .high { color: #b00020; font-weight: 600; }
+    .low { color: #1b6e2d; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fraud Detection Demo</h1>
+    <p class="muted">Simulated transaction data. Everything runs in your browser.</p>
+
+    <h2>1. Data</h2>
+    <div class="row">
+      <button id="btnGenerate" type="button">Generate data</button>
+      <button id="btnAdd" type="button" disabled>Add more users</button>
+    </div>
+    <p id="dataInfo" role="status">Click "Generate data" to start.</p>
+    <div id="dataControls" class="row" hidden>
+      <label for="rowsInput">Rows to display</label>
+      <input id="rowsInput" type="number" min="1" max="1000" value="5">
+    </div>
+    <div id="dataTable"></div>
+    <div id="userAverages"></div>
+
+    <h2>2. Fraud check</h2>
+    <p class="muted">Score of 100 or more: block. Score of 50 to 99: warning.</p>
+    <div class="row">
+      <button id="btnRun" type="button" disabled>Run fraud check</button>
+    </div>
+    <div id="results" role="status"></div>
+
+    <h2>3. Check one transaction</h2>
+    <div class="row">
+      <label for="amountInput">Transaction amount</label>
+      <input id="amountInput" type="number" min="0" step="100" value="5000">
+      <button id="btnCheck" type="button" disabled>Check transaction</button>
+    </div>
+    <p id="checkResult" role="status"></p>
+  </main>
+
+  <script>
+    // ---------------------------------------------------------------
+    // Settings - change these numbers to tune the demo
+    // ---------------------------------------------------------------
+    const INITIAL_USERS = 1000;
+    const INITIAL_TRANSACTIONS = 50000;
+    const EXTRA_USERS = 500;
+    const TRANSACTIONS_PER_EXTRA_USER = 20;
+
+    const NUM_LOCATIONS = 50;
+    const NUM_DEVICES = 100;
+    const NUM_RECIPIENTS = 2000;
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const START_DATE = Date.UTC(2023, 0, 1);
+    const END_DATE = Date.UTC(2023, 11, 31);
+    const TIME_SPAN_SECONDS = (END_DATE - START_DATE) / 1000;
+
+    const AMOUNT_DEVIATION_FACTOR = 10;
+    const FREQUENCY_DEVIATION_FACTOR = 15;
+    const NEW_LOCATION_RISK_POINTS = 25;
+    const BLOCK_THRESHOLD = 100;
+    const WARNING_THRESHOLD = 50;
+    const NEW_DEVICE_RISK_POINTS = BLOCK_THRESHOLD; // a new device = immediate block
+    const SHARED_DEVICE_RISK_POINTS = 40;
+    const SHARED_DEVICE_HIGH_PAYMENT_FACTOR = 2.0;
+
+    // ---------------------------------------------------------------
+    // Random number helpers (seeded, so the same seed gives the same data)
+    // ---------------------------------------------------------------
+    function makeRng(seed) {
+      return function () {
+        seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function randInt(rng, low, high) { // inclusive on both ends
+      return low + Math.floor(rng() * (high - low + 1));
+    }
+
+    function normal(rng, mean, sd) { // Box-Muller
+      const u1 = rng() || 1e-12;
+      const u2 = rng();
+      return mean + sd * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    }
+
+    function gamma(rng, shape) { // Marsaglia-Tsang
+      if (shape < 1) return gamma(rng, shape + 1) * Math.pow(rng(), 1 / shape);
+      const d = shape - 1 / 3;
+      const c = 1 / Math.sqrt(9 * d);
+      while (true) {
+        let x, v;
+        do { x = normal(rng, 0, 1); v = 1 + c * x; } while (v <= 0);
+        v = v * v * v;
+        const u = rng();
+        if (u < 1 - 0.0331 * x * x * x * x ||
+            Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+      }
+    }
+
+    // Returns a function that picks an index (0..n-1) using random weights
+    function makeWeightedPicker(rng, n, alpha) {
+      const weights = Array.from({ length: n }, () => gamma(rng, alpha));
+      const total = weights.reduce((a, b) => a + b, 0);
+      const cumulative = [];
+      let running = 0;
+      for (const w of weights) { running += w / total; cumulative.push(running); }
+      return function () {
+        const r = rng();
+        for (let i = 0; i < n; i++) if (r < cumulative[i]) return i;
+        return n - 1;
+      };
+    }
+
+    // ---------------------------------------------------------------
+    // Part 1: data generation
+    // ---------------------------------------------------------------
+    function makeTransactions(userIds, amountMean, amountSd, rng) {
+      const pickLocation = makeWeightedPicker(rng, NUM_LOCATIONS, 0.5);
+      const pickDevice = makeWeightedPicker(rng, NUM_DEVICES, 0.3);
+      return userIds.map(function (uid) {
+        return {
+          user_id: uid,
+          amount: Math.max(0, normal(rng, amountMean, amountSd)),
+          transaction_date: START_DATE + Math.floor(rng() * TIME_SPAN_SECONDS) * 1000,
+          location_id: pickLocation() + 1,
+          device_id: pickDevice() + 1,
+          recipient_id: randInt(rng, 1, NUM_RECIPIENTS)
+        };
+      });
+    }
+
+    function sortData(rows) {
+      return rows.sort(function (a, b) {
+        return (a.user_id - b.user_id) || (a.transaction_date - b.transaction_date);
+      });
+    }
+
+    function generateData() {
+      const rng = makeRng(42); // fixed seed = same data every time
+      const userIds = Array.from({ length: INITIAL_TRANSACTIONS },
+        function () { return randInt(rng, 1, INITIAL_USERS); });
+      return sortData(makeTransactions(userIds, 500, 200, rng));
+    }
+
+    function addUsers(rows) {
+      const rng = makeRng(Date.now());
+      let maxId = 0;
+      for (const r of rows) if (r.user_id > maxId) maxId = r.user_id;
+      let all = rows.slice();
+      for (let uid = maxId + 1; uid <= maxId + EXTRA_USERS; uid++) {
+        const ids = new Array(TRANSACTIONS_PER_EXTRA_USER).fill(uid);
+        all = all.concat(makeTransactions(ids, 550, 180, rng));
+      }
+      return sortData(all);
+    }
+
+    // ---------------------------------------------------------------
+    // Part 2: risk scoring
+    // ---------------------------------------------------------------
+    function hasNewItem(recentSet, historySet) {
+      for (const item of recentSet) if (!historySet.has(item)) return true;
+      return false;
+    }
+
+    function runRiskAnalysis(rows) {
+      let minDate = Infinity, latestDate = -Infinity, amountSum = 0;
+      for (const r of rows) {
+        if (r.transaction_date < minDate) minDate = r.transaction_date;
+        if (r.transaction_date > latestDate) latestDate = r.transaction_date;
+        amountSum += r.amount;
+      }
+      const overallAvg = amountSum / rows.length;
+
+      // "Recent" = last 1 week. "History" = everything before that.
+      const windowStart = latestDate - 7 * DAY_MS;
+      const daysInHistory = Math.floor((windowStart - minDate) / DAY_MS);
+
+      const history = new Map();
+      const recent = new Map();
+      const recentRows = [];
+
+      for (const r of rows) {
+        if (r.transaction_date < windowStart) {
+          let h = history.get(r.user_id);
+          if (!h) { h = { sum: 0, count: 0, locations: new Set(), devices: new Set() }; history.set(r.user_id, h); }
+          h.sum += r.amount;
+          h.count += 1;
+          h.locations.add(r.location_id);
+          h.devices.add(r.device_id);
+        } else {
+          recentRows.push(r);
+          let c = recent.get(r.user_id);
+          if (!c) { c = { count: 0, max: 0, locations: new Set(), devices: new Set() }; recent.set(r.user_id, c); }
+          c.count += 1;
+          if (r.amount > c.max) c.max = r.amount;
+          c.locations.add(r.location_id);
+          c.devices.add(r.device_id);
+        }
+      }
+
+      // Shared device risk: several users on one device + a high payment
+      const devices = new Map();
+      for (const r of recentRows) {
+        let d = devices.get(r.device_id);
+        if (!d) { d = { users: new Set(), max: 0 }; devices.set(r.device_id, d); }
+        d.users.add(r.user_id);
+        if (r.amount > d.max) d.max = r.amount;
+      }
+      const riskyDevices = new Set();
+      for (const [deviceId, d] of devices) {
+        if (d.users.size > 1 && d.max > overallAvg * SHARED_DEVICE_HIGH_PAYMENT_FACTOR) {
+          riskyDevices.add(deviceId);
+        }
+      }
+      const riskyUsers = new Set();
+      for (const r of recentRows) if (riskyDevices.has(r.device_id)) riskyUsers.add(r.user_id);
+
+      const users = [];
+      for (const [userId, h] of history) {
+        const c = recent.get(userId);
+        const historicalAvg = h.sum / h.count;
+        const weekly = daysInHistory > 0 ? (h.count / daysInHistory) * 7 : 0;
+        const recentCount = c ? c.count : 0;
+        const recentMax = c ? c.max : 0;
+
+        const amountMultiplier = historicalAvg > 0 ? recentMax / historicalAvg : 0;
+        const amountPoints = Math.max(0, (amountMultiplier - 1) * AMOUNT_DEVIATION_FACTOR);
+
+        const frequencyMultiplier = weekly > 0 ? recentCount / weekly : 0;
+        const frequencyPoints = Math.max(0, (frequencyMultiplier - 1) * FREQUENCY_DEVIATION_FACTOR);
+
+        const newLocationPoints = c && hasNewItem(c.locations, h.locations) ? NEW_LOCATION_RISK_POINTS : 0;
+        const newDevicePoints = c && hasNewItem(c.devices, h.devices) ? NEW_DEVICE_RISK_POINTS : 0;
+        const sharedDevicePoints = riskyUsers.has(userId) ? SHARED_DEVICE_RISK_POINTS : 0;
+
+        const score = amountPoints + frequencyPoints + newLocationPoints + newDevicePoints + sharedDevicePoints;
+        users.push({
+          user_id: userId,
+          risk_score: score,
+          historical_avg_amount: historicalAvg,
+          recent_max_amount: recentMax,
+          historical_avg_weekly_transactions: weekly,
+          recent_num_transactions: recentCount,
+          new_location_risk_points: newLocationPoints,
+          new_device_risk_points: newDevicePoints,
+          shared_device_risk_points: sharedDevicePoints,
+          status: score >= BLOCK_THRESHOLD ? "BLOCK" : score >= WARNING_THRESHOLD ? "WARNING" : "OK"
+        });
+      }
+      return users;
+    }
+
+    // ---------------------------------------------------------------
+    // Part 3: the page
+    // ---------------------------------------------------------------
+    const $ = function (id) { return document.getElementById(id); };
+    let data = null;     // all transactions
+    let results = null;  // risk results per user
+
+    const DATA_COLUMNS = [
+      ["user_id", "User", function (v) { return v; }],
+      ["amount", "Amount", function (v) { return v.toFixed(2); }],
+      ["transaction_date", "Date (UTC)", function (v) {
+        return new Date(v).toISOString().replace("T", " ").slice(0, 19); }],
+      ["location_id", "Location", function (v) { return v; }],
+      ["device_id", "Device", function (v) { return v; }],
+      ["recipient_id", "Recipient", function (v) { return v; }]
+    ];
+
+    const USER_AVERAGE_COLUMNS = [
+      ["user_id", "User", function (v) { return v; }],
+      ["count", "Transactions", function (v) { return v; }],
+      ["average", "Average amount", function (v) { return v.toFixed(2); }]
+    ];
+
+    // Average transaction amount for each user, sorted by user id
+    function userAverages(rows) {
+      const totals = new Map();
+      for (const r of rows) {
+        let t = totals.get(r.user_id);
+        if (!t) { t = { user_id: r.user_id, count: 0, sum: 0 }; totals.set(r.user_id, t); }
+        t.count += 1;
+        t.sum += r.amount;
+      }
+      return Array.from(totals.values())
+        .map(function (t) { return { user_id: t.user_id, count: t.count, average: t.sum / t.count }; })
+        .sort(function (a, b) { return a.user_id - b.user_id; });
+    }
+
+    const RESULT_COLUMNS = [
+      ["user_id", "User", function (v) { return v; }],
+      ["risk_score", "Risk score", function (v) { return v.toFixed(1); }],
+      ["historical_avg_amount", "Usual amount", function (v) { return v.toFixed(2); }],
+      ["recent_max_amount", "Recent max", function (v) { return v.toFixed(2); }],
+      ["historical_avg_weekly_transactions", "Usual per week", function (v) { return v.toFixed(2); }],
+      ["recent_num_transactions", "Recent count", function (v) { return v; }],
+      ["new_location_risk_points", "New location", function (v) { return v; }],
+      ["new_device_risk_points", "New device", function (v) { return v; }],
+      ["shared_device_risk_points", "Shared device", function (v) { return v; }]
+    ];
+
+    function tableHtml(columns, rows) {
+      let html = '<div class="table-wrap"><table><thead><tr>';
+      for (const col of columns) html += "<th scope=\"col\">" + col[1] + "</th>";
+      html += "</tr></thead><tbody>";
+      for (const row of rows) {
+        html += "<tr>";
+        for (const col of columns) html += "<td>" + col[2](row[col[0]]) + "</td>";
+        html += "</tr>";
+      }
+      return html + "</tbody></table></div>";
+    }
+
+    function averageAmount() {
+      let sum = 0;
+      for (const r of data) sum += r.amount;
+      return sum / data.length;
+    }
+
+    function renderData() {
+      if (!data) return;
+      const userCount = new Set(data.map(function (r) { return r.user_id; })).size;
+      $("dataInfo").textContent = "Users: " + userCount +
+        "  |  Transactions: " + data.length +
+        "  |  Average amount: " + averageAmount().toFixed(2);
+      $("dataControls").hidden = false;
+      let n = parseInt($("rowsInput").value, 10);
+      if (!(n >= 1)) n = 1;
+      if (n > 1000) n = 1000;
+      $("dataTable").innerHTML = tableHtml(DATA_COLUMNS, data.slice(0, n));
+
+      const averages = userAverages(data);
+      $("userAverages").innerHTML =
+        "<h3>Average transaction per user (" + averages.length + " users)</h3>" +
+        tableHtml(USER_AVERAGE_COLUMNS, averages);
+    }
+
+    function renderResults() {
+      const box = $("results");
+      if (!results) { box.innerHTML = ""; return; }
+      const byScore = function (a, b) { return b.risk_score - a.risk_score; };
+      const blocked = results.filter(function (u) { return u.status === "BLOCK"; }).sort(byScore);
+      const warned = results.filter(function (u) { return u.status === "WARNING"; }).sort(byScore);
+      const okCount = results.length - blocked.length - warned.length;
+
+      let html = '<div class="counts">' +
+        "<div><strong>" + blocked.length + "</strong>Block</div>" +
+        "<div><strong>" + warned.length + "</strong>Warning</div>" +
+        "<div><strong>" + okCount + "</strong>OK</div></div>";
+
+      html += "<h3>High risk users (block recommended)</h3>";
+      html += blocked.length ? tableHtml(RESULT_COLUMNS, blocked) : "<p>None found.</p>";
+      html += "<h3>Warning users (monitor closely)</h3>";
+      html += warned.length ? tableHtml(RESULT_COLUMNS, warned) : "<p>None found.</p>";
+      box.innerHTML = html;
+    }
+
+    function dataChanged() {
+      results = null;
+      renderResults();
+      $("checkResult").textContent = "";
+      $("btnAdd").disabled = false;
+      $("btnRun").disabled = false;
+      $("btnCheck").disabled = false;
+      renderData();
+    }
+
+    $("btnGenerate").addEventListener("click", function () {
+      data = generateData();
+      dataChanged();
+    });
+
+    $("btnAdd").addEventListener("click", function () {
+      if (!data) return;
+      data = addUsers(data);
+      dataChanged();
+    });
+
+    $("rowsInput").addEventListener("input", renderData);
+
+    $("btnRun").addEventListener("click", function () {
+      if (!data) return;
+      results = runRiskAnalysis(data);
+      renderResults();
+    });
+
+    $("btnCheck").addEventListener("click", function () {
+      if (!data) return;
+      const amount = parseFloat($("amountInput").value);
+      const out = $("checkResult");
+      if (!(amount >= 0)) {
+        out.className = "";
+        out.textContent = "Enter an amount of 0 or more.";
+        return;
+      }
+      if (amount > averageAmount() * 3) {
+        out.className = "high";
+        out.textContent = "Risk: HIGH. The amount is unusually high compared to the overall average.";
+      } else {
+        out.className = "low";
+        out.textContent = "Risk: LOW.";
+      }
+    });
+  </script>
+</body>
+</html>
